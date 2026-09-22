@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     # 一次性恢复令牌有效期（秒）
     token_ttl: int = 600
 
+    # 单条策略规则在整篇文档上的执行超时（毫秒）
+    rule_timeout_ms: int = 1000
+
     # 后台清理周期（秒）
     cleanup_interval: int = 300
 

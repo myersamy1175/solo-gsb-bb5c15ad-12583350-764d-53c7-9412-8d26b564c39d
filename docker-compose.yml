@@ -12,6 +12,7 @@ services:
       REDACT_DEFAULT_TTL: "86400"        # 文档映射默认 1 天过期
       REDACT_TOKEN_TTL: "600"            # 一次性恢复令牌 10 分钟过期
       REDACT_CLEANUP_INTERVAL: "300"
+      REDACT_RULE_TIMEOUT_MS: "1000"     # 单条策略规则在整篇文档上的执行超时（毫秒）
     volumes:
       - redaction-data:/data
     restart: unless-stopped

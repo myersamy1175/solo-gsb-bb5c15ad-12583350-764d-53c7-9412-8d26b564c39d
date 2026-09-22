@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS fragments (
     priority      INTEGER NOT NULL,
     kept          INTEGER NOT NULL,
     drop_reason   TEXT,
+    source        TEXT NOT NULL DEFAULT 'manual',  -- manual 或命中规则的 rule_id
     cipher_value  BLOB                   -- 仅保留片段加密值；丢弃片段为 NULL
 );
 
@@ -41,7 +42,37 @@ CREATE TABLE IF NOT EXISTS restore_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tokens_document ON restore_tokens(document_id);
+
+CREATE TABLE IF NOT EXISTS policies (
+    id          TEXT PRIMARY KEY,
+    rules       TEXT NOT NULL,           -- JSON 数组：rule_id/category/pattern/priority
+    created_at  TEXT NOT NULL            -- ISO-8601 UTC；策略创建后不可变、不过期
+);
 """
+
+# 对既有数据库的幂等列迁移：(表, 列, DDL)
+MIGRATIONS = (
+    (
+        "fragments",
+        "source",
+        "ALTER TABLE fragments ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+    ),
+)
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    for table, column, ddl in MIGRATIONS:
+        async with db.execute(f"PRAGMA table_info({table})") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if cols and column not in cols:
+            await db.execute(ddl)
+
+
+def _migrate_sync(conn: sqlite3.Connection) -> None:
+    for table, column, ddl in MIGRATIONS:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if cols and column not in cols:
+            conn.execute(ddl)
 
 
 async def init_db(db_path: str = ":memory:") -> None:
@@ -51,6 +82,7 @@ async def init_db(db_path: str = ":memory:") -> None:
     """
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(SCHEMA)
+        await _migrate(db)
         await db.commit()
 
 
@@ -59,6 +91,7 @@ def init_db_sync(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_sync(conn)
         conn.commit()
     finally:
         conn.close()

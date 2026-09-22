@@ -2,10 +2,13 @@
 
 规则（确定性、无随机成分）：
 * ``start`` / ``end`` 均为 Unicode 码位偏移，左闭右开，依据 Python 字符串索引；
-* 片段按 (优先级降序, start 升序, 长度降序, 客户端提交顺序) 排序；
+* 片段按 (优先级降序, start 升序, 长度降序, 提交序号) 排序；
+* 提交序号中人工片段先于自动片段，因此优先级、起止位置与长度均相同
+  （完全平手）时人工片段优先落位；
 * 排序靠前的片段先落位，与之重叠的后续片段被丢弃，``drop_reason`` 标为
   ``"overlaps_higher_priority"``（同优先级先到先得）；
-* 同一文档内 (类别, 原文) 相同的片段复用同一占位符，序号按首次出现顺序分配。
+* 同一文档内 (类别, 原文) 相同的片段复用同一占位符，序号按首次出现顺序分配；
+* 每个片段标注来源 ``source``：``"manual"``（人工提交）或命中规则的 rule_id。
 """
 from __future__ import annotations
 
@@ -16,6 +19,8 @@ CATEGORY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
 # 占位符形如 {{PERSON:01}}，类别仅允许大写字母/数字/下划线，杜绝注入到占位符语法
 PLACEHOLDER_PATTERN = re.compile(r"\{\{([A-Z][A-Z0-9_]{0,31}):(\d+)\}\}")
 
+SOURCE_MANUAL = "manual"
+
 
 @dataclass(frozen=True)
 class InputSpan:
@@ -23,7 +28,8 @@ class InputSpan:
     end: int
     priority: int
     category: str
-    ordinal: int  # 客户端提交顺序，用于稳定决胜
+    ordinal: int  # 提交顺序（人工片段在前、自动片段随后），用于稳定决胜
+    source: str = SOURCE_MANUAL  # "manual" 或命中规则的 rule_id
 
 
 @dataclass
@@ -36,6 +42,7 @@ class ResolvedSpan:
     placeholder: str
     kept: bool
     drop_reason: str | None = None
+    source: str = SOURCE_MANUAL
 
 
 @dataclass
@@ -77,6 +84,7 @@ def resolve_spans(text: str, inputs: list[InputSpan]) -> list[ResolvedSpan]:
                 placeholder="",
                 kept=False,
                 drop_reason="overlaps_higher_priority",
+                source=span.source,
             )
             continue
         occupied.append((span.start, span.end))
@@ -89,6 +97,7 @@ def resolve_spans(text: str, inputs: list[InputSpan]) -> list[ResolvedSpan]:
             value=value,
             placeholder="",
             kept=True,
+            source=span.source,
         )
 
     return [resolved[i] for i in sorted(resolved)]

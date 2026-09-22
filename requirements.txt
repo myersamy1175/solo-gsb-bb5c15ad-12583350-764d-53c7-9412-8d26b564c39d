@@ -4,3 +4,4 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 aiosqlite==0.20.0
 cryptography==44.0.0
+regex==2024.11.6

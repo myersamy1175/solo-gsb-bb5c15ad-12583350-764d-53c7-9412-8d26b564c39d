@@ -1,21 +1,31 @@
-"""文档脱敏、查询、恢复的业务逻辑。"""
+"""文档脱敏、查询、恢复与自动脱敏策略的业务逻辑。"""
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 
 from app.crypto import CryptoBox, random_token
+from app.policy import (
+    PolicyRule,
+    RuleTimeoutError,
+    compile_pattern,
+    find_spans,
+)
 from app.redaction import (
     PLACEHOLDER_PATTERN,
+    SOURCE_MANUAL,
     InputSpan,
     redact,
     validate_category,
 )
 from app.schemas import (
+    MAX_SPANS,
     FragmentOut,
+    PolicyCreateRequest,
     RestoredItem,
     RestoredOccurrence,
     SubmitRequest,
@@ -55,12 +65,68 @@ class DocumentService:
         default_ttl: int,
         max_ttl: int,
         token_ttl: int,
+        rule_timeout: float = 1.0,
     ) -> None:
         self.db = db
         self.crypto = crypto
         self.default_ttl = default_ttl
         self.max_ttl = max_ttl
         self.token_ttl = token_ttl
+        self.rule_timeout = rule_timeout  # 单条策略规则在整篇文档上的执行时限（秒）
+
+    # ---------- 自动脱敏策略（创建后不可变） ----------
+
+    async def create_policy(self, req: PolicyCreateRequest) -> dict:
+        rules: list[dict] = []
+        for r in req.rules:
+            try:
+                validate_category(r.category)
+            except ValueError as exc:
+                raise ServiceError(str(exc), 422) from exc
+            try:
+                compile_pattern(r.pattern)  # 可编译且拒绝空匹配
+            except ValueError as exc:
+                raise ServiceError(str(exc), 422) from exc
+            rules.append(
+                {
+                    "rule_id": r.rule_id,
+                    "category": r.category,
+                    "pattern": r.pattern,
+                    "priority": r.priority,
+                }
+            )
+
+        policy_id = uuid.uuid4().hex
+        now = utcnow()
+        await self.db.execute(
+            "INSERT INTO policies (id, rules, created_at) VALUES (?, ?, ?)",
+            (policy_id, json.dumps(rules, ensure_ascii=False), to_iso(now)),
+        )
+        await self.db.commit()
+        return {"policy_id": policy_id, "rules": rules, "created_at": now}
+
+    async def get_policy(self, policy_id: str) -> dict:
+        async with self.db.execute(
+            "SELECT id, rules, created_at FROM policies WHERE id = ?",
+            (policy_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            raise NotFoundError("策略不存在")
+        return {
+            "policy_id": row["id"],
+            "rules": json.loads(row["rules"]),
+            "created_at": from_iso(row["created_at"]),
+        }
+
+    async def _load_policy_rules(self, policy_id: str) -> list[PolicyRule]:
+        async with self.db.execute(
+            "SELECT rules FROM policies WHERE id = ?", (policy_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            raise NotFoundError("策略不存在")
+        return [PolicyRule(**r) for r in json.loads(row["rules"])]
 
     # ---------- 提交脱敏 ----------
 
@@ -82,6 +148,7 @@ class DocumentService:
             except ValueError as exc:
                 raise ServiceError(str(exc), 422) from exc
 
+        # 人工片段序号在前：与自动片段完全平手（优先级/起止/长度均相同）时人工优先
         inputs = [
             InputSpan(
                 start=s.start,
@@ -89,9 +156,33 @@ class DocumentService:
                 priority=s.priority,
                 category=s.category,
                 ordinal=i,
+                source=SOURCE_MANUAL,
             )
             for i, s in enumerate(req.spans)
         ]
+
+        if req.policy_id:
+            rules = await self._load_policy_rules(req.policy_id)
+            try:
+                auto = find_spans(req.text, rules, self.rule_timeout)
+            except RuleTimeoutError as exc:
+                # 任一规则超时：整次提交失败，不写库
+                raise ServiceError(str(exc), 422) from exc
+            if len(auto) > MAX_SPANS:
+                raise ServiceError(f"自动脱敏片段数量超过上限（{MAX_SPANS}）", 422)
+            base = len(inputs)
+            inputs.extend(
+                InputSpan(
+                    start=a.start,
+                    end=a.end,
+                    priority=a.priority,
+                    category=a.category,
+                    ordinal=base + j,
+                    source=a.rule_id,
+                )
+                for j, a in enumerate(auto)
+            )
+
         result = redact(req.text, inputs)
 
         doc_id = uuid.uuid4().hex
@@ -114,8 +205,9 @@ class DocumentService:
             )
             await cur.executemany(
                 "INSERT INTO fragments (document_id, placeholder, category,"
-                " start_offset, end_offset, priority, kept, drop_reason, cipher_value)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " start_offset, end_offset, priority, kept, drop_reason, source,"
+                " cipher_value)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         doc_id,
@@ -126,6 +218,7 @@ class DocumentService:
                         sp.priority,
                         int(sp.kept),
                         sp.drop_reason,
+                        sp.source,
                         self.crypto.encrypt(sp.value) if sp.kept else None,
                     )
                     for sp in result.spans
@@ -165,7 +258,7 @@ class DocumentService:
 
         async with self.db.execute(
             "SELECT placeholder, category, start_offset, end_offset, priority,"
-            " kept, drop_reason FROM fragments WHERE document_id = ?"
+            " kept, drop_reason, source FROM fragments WHERE document_id = ?"
             " ORDER BY start_offset",
             (document_id,),
         ) as cur:
@@ -304,6 +397,7 @@ class DocumentService:
             priority=sp.priority,
             kept=sp.kept,
             drop_reason=sp.drop_reason,
+            source=sp.source,
         )
 
     @staticmethod
@@ -316,4 +410,5 @@ class DocumentService:
             priority=row["priority"],
             kept=bool(row["kept"]),
             drop_reason=row["drop_reason"],
+            source=row["source"],
         )

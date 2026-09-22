@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends, Request
 
 from app.schemas import (
     DocumentResponse,
+    PolicyCreateRequest,
+    PolicyResponse,
     RestoreRequest,
     RestoreResponse,
     SubmitRequest,
@@ -24,12 +26,30 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+@router.post("/policies", response_model=PolicyResponse, status_code=201)
+async def create_policy(
+    payload: PolicyCreateRequest,
+    service: DocumentService = Depends(get_service),
+) -> dict:
+    """创建自动脱敏策略（创建后不可变）；正则必须可编译且拒绝空匹配。"""
+    return await service.create_policy(payload)
+
+
+@router.get("/policies/{policy_id}", response_model=PolicyResponse)
+async def get_policy(
+    policy_id: str,
+    service: DocumentService = Depends(get_service),
+) -> dict:
+    """查询自动脱敏策略。"""
+    return await service.get_policy(policy_id)
+
+
 @router.post("/documents", response_model=SubmitResponse, status_code=201)
 async def submit(
     payload: SubmitRequest,
     service: DocumentService = Depends(get_service),
 ) -> dict:
-    """提交原文与敏感片段，返回脱敏文本、片段明细与一次性恢复令牌。"""
+    """提交原文与敏感片段（可附 policy_id 自动生成片段），返回脱敏结果与一次性令牌。"""
     return await service.submit(payload)
 
 

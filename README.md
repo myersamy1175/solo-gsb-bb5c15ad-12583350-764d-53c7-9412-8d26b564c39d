@@ -7,6 +7,9 @@
 3. 原文与片段映射经 **Fernet 对称加密** 后存入 SQLite，且 **可过期**（定时 + 懒清理）；
 4. 恢复接口仅认 **一次性令牌**：用后作废并轮换，只能还原请求中显式指定的占位符。
 
+另支持 **可复用的自动脱敏策略**：预先注册一组「正则 + 类别 + 优先级」规则，
+提交文档时传入 `policy_id`，服务端即在原文上自动生成脱敏片段并与人工片段合并消解。
+
 ---
 
 ## 一、单命令启动（Docker Compose）
@@ -70,12 +73,13 @@ python -m pytest -q
 
 ### 1. 提交脱敏 `POST /documents`
 
-请求：
+请求（`spans` 与 `policy_id` 至少提供其一，可同时提供）：
 
 ```json
 {
   "text": "甲方张三向乙方李四借款人民币10000元。",
   "ttl": 3600,
+  "policy_id": "可选：自动脱敏策略 ID",
   "spans": [
     {"start": 2, "end": 4,  "priority": 5, "category": "person"},
     {"start": 7, "end": 9,  "priority": 5, "category": "PERSON"},
@@ -93,19 +97,25 @@ python -m pytest -q
   "redacted_text": "甲方{{PERSON:01}}向乙方{{PERSON:02}}借款{{MONEY:01}}。",
   "fragments": [
     {"placeholder": "{{PERSON:01}}", "category": "PERSON", "start": 2, "end": 4,
-     "priority": 5, "kept": true,  "drop_reason": null},
+     "priority": 5, "kept": true,  "drop_reason": null, "source": "manual"},
     {"placeholder": "{{PERSON:02}}", "category": "PERSON", "start": 7, "end": 9,
-     "priority": 5, "kept": true,  "drop_reason": null},
+     "priority": 5, "kept": true,  "drop_reason": null, "source": "manual"},
     {"placeholder": "{{MONEY:01}}",  "category": "MONEY",  "start": 11, "end": 20,
-     "priority": 3, "kept": true,  "drop_reason": null},
+     "priority": 3, "kept": true,  "drop_reason": null, "source": "manual"},
     {"placeholder": "", "category": "BLOCK", "start": 2, "end": 9,
-     "priority": 0, "kept": false, "drop_reason": "overlaps_higher_priority"}
+     "priority": 0, "kept": false, "drop_reason": "overlaps_higher_priority",
+     "source": "manual"}
   ],
   "restore_token": "6c538c2c…（64 位十六进制，仅此一次返回明文）",
   "expires_at": "2026-09-21T12:00:00.000000Z",
   "token_expires_at": "2026-09-21T11:10:00.000000Z"
 }
 ```
+
+每个片段的 `source` 标注来源：人工提交为 `"manual"`，策略自动命中为对应规则的
+`rule_id`。传入 `policy_id` 时，服务端先在 Unicode 原文上按策略规则生成自动片段，
+再与人工 `spans` 合并后统一消解重叠（见第四节）；策略不存在返回 `404`，
+任一规则执行超时返回 `422` 且整次提交不写入任何数据。
 
 ### 2. 查询脱敏结果 `GET /documents/{document_id}`
 
@@ -147,6 +157,45 @@ python -m pytest -q
 
 ### 4. 健康检查 `GET /health` → `{"status": "ok"}`
 
+### 5. 创建自动脱敏策略 `POST /policies`
+
+策略是一组可复用的正则规则，**创建后不可变**（不提供修改 / 删除接口），不过期。
+
+```json
+{
+  "rules": [
+    {"rule_id": "phone",  "category": "PHONE", "pattern": "1[3-9]\\d{9}",      "priority": 2},
+    {"rule_id": "amount", "category": "MONEY", "pattern": "\\d+(?:\\.\\d+)?元", "priority": 1}
+  ]
+}
+```
+
+响应 `201`：
+
+```json
+{
+  "policy_id": "9f2c…",
+  "rules": [
+    {"rule_id": "phone",  "category": "PHONE", "pattern": "1[3-9]\\d{9}",      "priority": 2},
+    {"rule_id": "amount", "category": "MONEY", "pattern": "\\d+(?:\\.\\d+)?元", "priority": 1}
+  ],
+  "created_at": "2026-09-22T08:00:00.000000Z"
+}
+```
+
+规则约束（违反返回 `422`）：
+
+- `rule_id`：策略内唯一，须匹配 `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`；
+- `category`：与人工片段相同的类别规范（`strip + 大写`，`[A-Z][A-Z0-9_]{0,31}`）；
+- `pattern`：必须可编译，且 **必须拒绝空匹配**（可匹配空串的表达式如 `a*`、`\d*`
+  会被拒绝）；正则由 `regex` 引擎执行，可用 `(?i)` 等内联标志；
+- 单条规则在整篇文档上的执行时间受 `REDACT_RULE_TIMEOUT_MS`（默认 1000 毫秒）
+  限制，防止回溯失控。
+
+### 6. 查询策略 `GET /policies/{policy_id}`
+
+返回策略全部规则与创建时间；不存在返回 `404`。
+
 ---
 
 ## 四、重叠消解与占位符规则
@@ -156,7 +205,8 @@ python -m pytest -q
 1. `priority` **数值大者优先**；
 2. 同优先级：`start` 小者优先；
 3. 仍相同：片段长者优先；
-4. 仍相同：按客户端提交顺序（先到先得）。
+4. 仍相同：按提交序号（先到先得）。人工片段的序号始终排在自动片段之前，
+   因此 **优先级、起止位置和长度均相同时人工片段优先**。
 
 排序后依次落位：与**任何已占用区间相交**的片段被丢弃，
 `drop_reason = "overlaps_higher_priority"`（同优先级被先到者占用也使用此标记）。
@@ -167,6 +217,14 @@ python -m pytest -q
 - 类别先 `strip + 大写`，须匹配 `[A-Z][A-Z0-9_]{0,31}`；
 - 同文档内 `(类别, 原文)` 完全相同的片段复用同一占位符；不同文档不复用；
 - 渲染替换自后向前进行，保证前序片段的位置不失效。
+
+人工与自动片段合并：
+
+- 自动片段由策略规则在 **Unicode 原文** 上正则匹配生成，与人工 `spans` 使用
+  同一套排序与落位规则；
+- 每条规则在整篇文档上的执行设有总超时（`REDACT_RULE_TIMEOUT_MS`），任一规则
+  超时则整次提交返回 `422`，且不写入任何文档数据；自动片段总数同样受 5000 条上限约束；
+- 返回的每个片段都带 `source` 字段：`"manual"` 或命中规则的 `rule_id`。
 
 ---
 
@@ -196,6 +254,7 @@ python -m pytest -q
 | `REDACT_MAX_TTL` | `604800` | 允许提交的最大 TTL（秒） |
 | `REDACT_TOKEN_TTL` | `600` | 一次性恢复令牌有效期（秒） |
 | `REDACT_CLEANUP_INTERVAL` | `300` | 后台过期清理周期（秒） |
+| `REDACT_RULE_TIMEOUT_MS` | `1000` | 单条策略规则在整篇文档上的执行超时（毫秒） |
 
 ---
 
@@ -206,13 +265,14 @@ app/
   main.py               FastAPI 入口、生命周期、后台清理、异常映射
   config.py             环境变量配置
   crypto.py             Fernet 加密封装、一次性令牌生成
-  db.py                 SQLite 建表（幂等）与连接
+  db.py                 SQLite 建表（幂等，含旧库列迁移）与连接
   redaction.py          重叠消解 / 稳定占位符 / 渲染（纯函数，易测）
+  policy.py             策略正则校验（拒绝空匹配）与带超时的自动片段生成
   schemas.py            请求与响应模型
   services/
-    document_service.py 提交、查询、恢复、过期清理业务逻辑
+    document_service.py 提交、查询、恢复、策略、过期清理业务逻辑
     errors.py           服务层错误 -> HTTP 状态码
-  routers/__init__.py    /documents、/documents/{id}、/restore、/health
+  routers/__init__.py    /documents、/documents/{id}、/policies、/restore、/health
   cli.py                keygen / initdb 命令
 tests/                  核心算法单元测试 + API 端到端测试
 Dockerfile              非 root 运行、内置健康检查

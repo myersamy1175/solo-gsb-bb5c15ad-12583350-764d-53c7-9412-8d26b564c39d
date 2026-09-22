@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI):
         default_ttl=settings.default_ttl,
         max_ttl=settings.max_ttl,
         token_ttl=settings.token_ttl,
+        rule_timeout=settings.rule_timeout_ms / 1000,
     )
 
     stop = asyncio.Event()
