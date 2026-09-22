@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import aiosqlite
 
 from app.crypto import CryptoBox, random_token
+from app.policy_engine import ProcessRuleRunner, apply_rules, compile_rules
 from app.redaction import (
+    AUTO,
     PLACEHOLDER_PATTERN,
     InputSpan,
     redact,
@@ -16,6 +18,7 @@ from app.redaction import (
 )
 from app.schemas import (
     FragmentOut,
+    MAX_SPANS,
     RestoredItem,
     RestoredOccurrence,
     SubmitRequest,
@@ -26,21 +29,8 @@ from app.services.errors import (
     ServiceError,
     UnauthorizedError,
 )
-
-# ISO-8601 UTC，固定 6 位微秒，保证字符串字典序与时间顺序一致，可直接用于 SQL 比较
-ISO = "%Y-%m-%dT%H:%M:%S.%fZ"
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def to_iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime(ISO)
-
-
-def from_iso(s: str) -> datetime:
-    return datetime.strptime(s, ISO).replace(tzinfo=timezone.utc)
+from app.services.policy_service import PolicyService
+from app.services.timeutil import from_iso, to_iso, utcnow
 
 
 def hash_token(token: str) -> str:
@@ -55,12 +45,18 @@ class DocumentService:
         default_ttl: int,
         max_ttl: int,
         token_ttl: int,
+        policies: PolicyService,
+        rule_timeout: float,
+        rule_runner: ProcessRuleRunner,
     ) -> None:
         self.db = db
         self.crypto = crypto
         self.default_ttl = default_ttl
         self.max_ttl = max_ttl
         self.token_ttl = token_ttl
+        self.policies = policies
+        self.rule_timeout = rule_timeout
+        self.rule_runner = rule_runner
 
     # ---------- 提交脱敏 ----------
 
@@ -68,6 +64,9 @@ class DocumentService:
         ttl = req.ttl if req.ttl is not None else self.default_ttl
         if not 1 <= ttl <= self.max_ttl:
             raise ServiceError(f"ttl 必须在 1..{self.max_ttl} 秒之间", 422)
+
+        if not req.spans and not req.policy_id:
+            raise ServiceError("spans 与 policy_id 至少提供其一", 422)
 
         # 位置校验：必须落在原文内且非空区间
         for i, s in enumerate(req.spans):
@@ -82,6 +81,7 @@ class DocumentService:
             except ValueError as exc:
                 raise ServiceError(str(exc), 422) from exc
 
+        # 人工片段先编号，自动片段追加其后；ordinal 仅用于稳定决胜
         inputs = [
             InputSpan(
                 start=s.start,
@@ -92,6 +92,33 @@ class DocumentService:
             )
             for i, s in enumerate(req.spans)
         ]
+
+        if req.policy_id is not None:
+            # 策略缺失 -> 404；规则非法 / 超时 / 空匹配 / 命中过多 -> 422，均不写文档
+            specs = await self.policies.load_specs(req.policy_id)
+            compiled = compile_rules(specs)
+            # 自动片段数量与人工片段合并后不得超过片段上限
+            auto_matches = await apply_rules(
+                req.text,
+                compiled,
+                timeout=self.rule_timeout,
+                max_matches=MAX_SPANS - len(inputs),
+                runner=self.rule_runner,
+            )
+            base = len(inputs)
+            for j, m in enumerate(auto_matches):
+                inputs.append(
+                    InputSpan(
+                        start=m.start,
+                        end=m.end,
+                        priority=m.rule.priority,
+                        category=m.rule.category,
+                        ordinal=base + j,
+                        source=AUTO,
+                        rule_id=m.rule.rule_id,
+                    )
+                )
+
         result = redact(req.text, inputs)
 
         doc_id = uuid.uuid4().hex
@@ -103,19 +130,21 @@ class DocumentService:
 
         async with self.db.cursor() as cur:
             await cur.execute(
-                "INSERT INTO documents (id, ciphertext, redacted, expires_at)"
-                " VALUES (?, ?, ?, ?)",
+                "INSERT INTO documents (id, ciphertext, redacted, expires_at, policy_id)"
+                " VALUES (?, ?, ?, ?, ?)",
                 (
                     doc_id,
                     self.crypto.encrypt(req.text),
                     result.redacted_text,
                     to_iso(doc_expires),
+                    req.policy_id,
                 ),
             )
             await cur.executemany(
                 "INSERT INTO fragments (document_id, placeholder, category,"
-                " start_offset, end_offset, priority, kept, drop_reason, cipher_value)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " start_offset, end_offset, priority, kept, drop_reason, cipher_value,"
+                " source, rule_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         doc_id,
@@ -127,6 +156,8 @@ class DocumentService:
                         int(sp.kept),
                         sp.drop_reason,
                         self.crypto.encrypt(sp.value) if sp.kept else None,
+                        sp.source,
+                        sp.rule_id,
                     )
                     for sp in result.spans
                 ],
@@ -165,7 +196,7 @@ class DocumentService:
 
         async with self.db.execute(
             "SELECT placeholder, category, start_offset, end_offset, priority,"
-            " kept, drop_reason FROM fragments WHERE document_id = ?"
+            " kept, drop_reason, source, rule_id FROM fragments WHERE document_id = ?"
             " ORDER BY start_offset",
             (document_id,),
         ) as cur:
@@ -216,7 +247,7 @@ class DocumentService:
 
             await cur.execute(
                 "SELECT placeholder, category, start_offset, end_offset, priority,"
-                " cipher_value FROM fragments"
+                " cipher_value, source, rule_id FROM fragments"
                 " WHERE document_id = ? AND kept = 1 ORDER BY start_offset",
                 (doc_id,),
             )
@@ -244,6 +275,8 @@ class DocumentService:
                                 start=r["start_offset"],
                                 end=r["end_offset"],
                                 priority=r["priority"],
+                                source=r["source"],
+                                rule_id=r["rule_id"],
                             )
                             for r in rows
                         ],
@@ -304,6 +337,8 @@ class DocumentService:
             priority=sp.priority,
             kept=sp.kept,
             drop_reason=sp.drop_reason,
+            source=sp.source,
+            rule_id=sp.rule_id,
         )
 
     @staticmethod
@@ -316,4 +351,6 @@ class DocumentService:
             priority=row["priority"],
             kept=bool(row["kept"]),
             drop_reason=row["drop_reason"],
+            source=row["source"],
+            rule_id=row["rule_id"],
         )

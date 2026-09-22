@@ -2,10 +2,14 @@
 
 规则（确定性、无随机成分）：
 * ``start`` / ``end`` 均为 Unicode 码位偏移，左闭右开，依据 Python 字符串索引；
-* 片段按 (优先级降序, start 升序, 长度降序, 客户端提交顺序) 排序；
+* 片段按 (优先级降序, start 升序, 长度降序, 人工优先, 提交顺序) 排序；
 * 排序靠前的片段先落位，与之重叠的后续片段被丢弃，``drop_reason`` 标为
   ``"overlaps_higher_priority"``（同优先级先到先得）；
 * 同一文档内 (类别, 原文) 相同的片段复用同一占位符，序号按首次出现顺序分配。
+
+``source`` 区分片段来源：``"manual"`` 为客户端手传片段，``"auto"`` 为策略规则
+在原文上自动命中的片段；自动片段通过 ``rule_id`` 标注来源规则。优先级、起止
+位置和长度完全相同时，人工片段优先于自动片段。
 """
 from __future__ import annotations
 
@@ -16,6 +20,12 @@ CATEGORY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
 # 占位符形如 {{PERSON:01}}，类别仅允许大写字母/数字/下划线，杜绝注入到占位符语法
 PLACEHOLDER_PATTERN = re.compile(r"\{\{([A-Z][A-Z0-9_]{0,31}):(\d+)\}\}")
 
+MANUAL = "manual"
+AUTO = "auto"
+
+# 排序决胜：0 = 人工片段，1 = 自动片段。人工片段在同等条件下优先落位。
+_SOURCE_RANK = {MANUAL: 0, AUTO: 1}
+
 
 @dataclass(frozen=True)
 class InputSpan:
@@ -24,6 +34,8 @@ class InputSpan:
     priority: int
     category: str
     ordinal: int  # 客户端提交顺序，用于稳定决胜
+    source: str = MANUAL
+    rule_id: str | None = None
 
 
 @dataclass
@@ -36,6 +48,8 @@ class ResolvedSpan:
     placeholder: str
     kept: bool
     drop_reason: str | None = None
+    source: str = MANUAL
+    rule_id: str | None = None
 
 
 @dataclass
@@ -59,7 +73,13 @@ def resolve_spans(text: str, inputs: list[InputSpan]) -> list[ResolvedSpan]:
     """校验、排序并一次性消解全部片段重叠。"""
     ordered = sorted(
         inputs,
-        key=lambda s: (-s.priority, s.start, -(s.end - s.start), s.ordinal),
+        key=lambda s: (
+            -s.priority,
+            s.start,
+            -(s.end - s.start),
+            _SOURCE_RANK.get(s.source, 1),
+            s.ordinal,
+        ),
     )
 
     occupied: list[tuple[int, int]] = []
@@ -77,6 +97,8 @@ def resolve_spans(text: str, inputs: list[InputSpan]) -> list[ResolvedSpan]:
                 placeholder="",
                 kept=False,
                 drop_reason="overlaps_higher_priority",
+                source=span.source,
+                rule_id=span.rule_id,
             )
             continue
         occupied.append((span.start, span.end))
@@ -89,6 +111,8 @@ def resolve_spans(text: str, inputs: list[InputSpan]) -> list[ResolvedSpan]:
             value=value,
             placeholder="",
             kept=True,
+            source=span.source,
+            rule_id=span.rule_id,
         )
 
     return [resolved[i] for i in sorted(resolved)]

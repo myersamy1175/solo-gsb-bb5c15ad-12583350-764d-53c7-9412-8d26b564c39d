@@ -17,6 +17,7 @@ def settings(tmp_path):
     s.master_key = "test-master-key"
     s.token_ttl = 600
     s.default_ttl = 86400
+    s.rule_timeout = 1.0
     return s
 
 

@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     # 一次性恢复令牌有效期（秒）
     token_ttl: int = 600
 
+    # 单条自动脱敏规则执行的超时时间（秒）；任一规则超时则整次提交 422
+    rule_timeout: float = 1.0
+
     # 后台清理周期（秒）
     cleanup_interval: int = 300
 

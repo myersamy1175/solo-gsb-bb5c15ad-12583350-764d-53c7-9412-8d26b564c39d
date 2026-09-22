@@ -5,12 +5,15 @@ from fastapi import APIRouter, Depends, Request
 
 from app.schemas import (
     DocumentResponse,
+    PolicyCreateRequest,
+    PolicyResponse,
     RestoreRequest,
     RestoreResponse,
     SubmitRequest,
     SubmitResponse,
 )
 from app.services.document_service import DocumentService
+from app.services.policy_service import PolicyService
 
 router = APIRouter()
 
@@ -19,9 +22,31 @@ def get_service(request: Request) -> DocumentService:
     return request.app.state.service
 
 
+def get_policy_service(request: Request) -> PolicyService:
+    return request.app.state.policy_service
+
+
 @router.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@router.post("/policies", response_model=PolicyResponse, status_code=201)
+async def create_policy(
+    payload: PolicyCreateRequest,
+    service: PolicyService = Depends(get_policy_service),
+) -> dict:
+    """创建自动脱敏策略（不可变）；每条规则含 rule_id、类别、正则、优先级。"""
+    return await service.create(payload)
+
+
+@router.get("/policies/{policy_id}", response_model=PolicyResponse)
+async def get_policy(
+    policy_id: str,
+    service: PolicyService = Depends(get_policy_service),
+) -> dict:
+    """查询自动脱敏策略及其全部规则（按创建顺序）。"""
+    return await service.get(policy_id)
 
 
 @router.post("/documents", response_model=SubmitResponse, status_code=201)
@@ -29,7 +54,11 @@ async def submit(
     payload: SubmitRequest,
     service: DocumentService = Depends(get_service),
 ) -> dict:
-    """提交原文与敏感片段，返回脱敏文本、片段明细与一次性恢复令牌。"""
+    """提交原文与敏感片段，返回脱敏文本、片段明细与一次性恢复令牌。
+
+    可传 ``policy_id``：服务端按策略规则在 Unicode 原文上生成自动片段，与
+    客户端 ``spans`` 合并后统一做重叠消解。
+    """
     return await service.submit(payload)
 
 

@@ -11,6 +11,7 @@ services:
       REDACT_DATABASE_URL: "/data/redaction.db"
       REDACT_DEFAULT_TTL: "86400"        # 文档映射默认 1 天过期
       REDACT_TOKEN_TTL: "600"            # 一次性恢复令牌 10 分钟过期
+      REDACT_RULE_TIMEOUT: "1.0"         # 单条自动脱敏规则执行超时（秒），超时整次提交 422
       REDACT_CLEANUP_INTERVAL: "300"
     volumes:
       - redaction-data:/data

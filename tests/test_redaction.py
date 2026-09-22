@@ -1,9 +1,9 @@
 """脱敏核心算法的纯单元测试。"""
-from app.redaction import InputSpan, redact, resolve_spans, assign_placeholders
+from app.redaction import AUTO, MANUAL, InputSpan, redact, resolve_spans, assign_placeholders
 
 
-def _span(start, end, priority, category, ordinal):
-    return InputSpan(start, end, priority, category, ordinal)
+def _span(start, end, priority, category, ordinal, source=MANUAL, rule_id=None):
+    return InputSpan(start, end, priority, category, ordinal, source=source, rule_id=rule_id)
 
 
 def test_basic_stable_placeholders():
@@ -94,3 +94,43 @@ def test_assign_placeholders_width_grows():
     assign_placeholders(spans)
     assert spans[0].placeholder == "{{X:01}}"
     assert spans[9].placeholder == "{{X:10}}"
+
+
+def test_manual_wins_when_priority_offsets_length_all_equal():
+    text = "abcdef"
+    # 同起止、同长度、同优先级；ordinal 让自动片段“先到”，仍应由人工片段胜出
+    result = redact(
+        text,
+        [
+            _span(0, 3, 0, "AUTO", 0, source=AUTO, rule_id="r1"),
+            _span(0, 3, 0, "MANUAL", 1),
+        ],
+    )
+    kept = [s for s in result.spans if s.kept]
+    dropped = [s for s in result.spans if not s.kept]
+    assert len(kept) == 1 and kept[0].category == "MANUAL"
+    assert kept[0].source == MANUAL and kept[0].rule_id is None
+    assert len(dropped) == 1 and dropped[0].source == AUTO
+    assert dropped[0].rule_id == "r1"
+    assert dropped[0].drop_reason == "overlaps_higher_priority"
+    assert result.redacted_text == "{{MANUAL:01}}def"
+
+
+def test_higher_priority_auto_beats_manual():
+    text = "abcdef"
+    result = redact(
+        text,
+        [
+            _span(0, 3, 5, "AUTO", 0, source=AUTO, rule_id="r1"),
+            _span(0, 3, 0, "MANUAL", 1),
+        ],
+    )
+    kept = [s for s in result.spans if s.kept]
+    assert kept[0].category == "AUTO" and kept[0].rule_id == "r1"
+
+
+def test_auto_span_labels_preserved_through_placeholder_assignment():
+    text = "张三张三"
+    result = redact(text, [_span(0, 2, 0, "PERSON", 0, source=AUTO, rule_id="p")])
+    assert result.redacted_text == "{{PERSON:01}}张三"
+    assert result.spans[0].source == AUTO and result.spans[0].rule_id == "p"

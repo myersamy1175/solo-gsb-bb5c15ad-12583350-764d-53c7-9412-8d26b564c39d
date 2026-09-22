@@ -11,9 +11,11 @@ from fastapi.responses import JSONResponse
 from app.config import get_settings
 from app.crypto import CryptoBox
 from app.db import connect, init_db
+from app.policy_engine import get_runner
 from app.routers import router
 from app.services.document_service import DocumentService
 from app.services.errors import ServiceError
+from app.services.policy_service import PolicyService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("redaction")
@@ -34,12 +36,18 @@ async def lifespan(app: FastAPI):
 
     db = await connect(settings.db_path)
     crypto = CryptoBox(settings.master_key, ephemeral=settings.ephemeral_key)
+    rule_runner = get_runner()
+    policy_service = PolicyService(db=db)
+    app.state.policy_service = policy_service
     app.state.service = DocumentService(
         db=db,
         crypto=crypto,
         default_ttl=settings.default_ttl,
         max_ttl=settings.max_ttl,
         token_ttl=settings.token_ttl,
+        policies=policy_service,
+        rule_timeout=settings.rule_timeout,
+        rule_runner=rule_runner,
     )
 
     stop = asyncio.Event()
@@ -62,6 +70,7 @@ async def lifespan(app: FastAPI):
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        rule_runner.close()
         await db.close()
 
 
